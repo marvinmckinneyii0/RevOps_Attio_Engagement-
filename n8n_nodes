@@ -1,0 +1,296 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "schedule-daily",
+      "name": "Daily 9am CST",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        224,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/gviz/tq?tqx=out:csv",
+        "options": {}
+      },
+      "id": "sheets-fetch",
+      "name": "Fetch Email Templates (Sheets)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        464,
+        400
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.attio.com/v2/objects/people/records/query",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"filter\": {\"trial_start_date\": {\"$ne\": null}}, \"limit\": 500}",
+        "options": {}
+      },
+      "id": "attio-fetch-trial",
+      "name": "Fetch Trial Contacts (Attio)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        704,
+        400
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// UNIFIED PERSONA SEGMENTATION + TEMPLATE MERGE ENGINE\n// DRY: Single engine handles all personas dynamically\n// Templates loaded from Google Sheets via upstream node\n// Generates approval URLs for decoupled approval workflow\n// ============================================================\n\nconst items = $input.all();\nconst now = DateTime.now();\n\n// === BUSINESS HOURS CHECK (9am-5pm CST, Mon-Fri) ===\nconst cstNow = now.setZone('America/Chicago');\nif (cstNow.hour < 9 || cstNow.hour >= 17 || cstNow.weekday > 5) {\n  return [{ json: { skip: true, reason: 'Outside business hours (9am-5pm CST, Mon-Fri)' } }];\n}\n\n// === LOAD TEMPLATES FROM GOOGLE SHEETS ===\n// Upstream node fetches CSV: persona,step,subject,html_body\nlet templates = {};\ntry {\n  const sheetsData = $('Fetch Email Templates (Sheets)').first().json;\n  const csvText = typeof sheetsData === 'string' ? sheetsData : (sheetsData.data || '');\n  if (csvText && typeof csvText === 'string') {\n    const rows = csvText.split('\\n').slice(1); // skip header\n    for (const row of rows) {\n      const cols = row.match(/(?:\"[^\"]*\"|[^,]*)(?:,|$)/g)?.map(c => c.replace(/,$/,'').replace(/^\"|\"$/g,'').trim()) || [];\n      if (cols.length >= 4) {\n        const key = `${cols[0]}_${cols[1]}`;\n        templates[key] = { subject: cols[2], htmlBody: cols[3] };\n      }\n    }\n  }\n} catch (e) {\n  // Templates not loaded - fall back to defaults\n}\n\n// === DEFAULT SEQUENCES (fallback if Sheets unavailable) ===\nconst PERSONAS = {\n  startup_steve: { label: 'Startup Steve', sequences: [\n    { day: 0, id: 'startup_welcome', subject: 'Welcome! Here\\'s how startups scale with us' },\n    { day: 2, id: 'startup_value', subject: 'How your team can save 10hrs/week' },\n    { day: 5, id: 'startup_social_proof', subject: 'Case study: Startup grew 3x in 90 days' },\n    { day: 8, id: 'startup_midtrial', subject: 'Your trial is halfway - unlock these features' },\n    { day: 12, id: 'startup_urgency', subject: 'Final days: Exclusive startup pricing inside' }\n  ]},\n  enterprise_eva: { label: 'Enterprise Eva', sequences: [\n    { day: 0, id: 'enterprise_welcome', subject: 'Welcome - your enterprise evaluation guide' },\n    { day: 3, id: 'enterprise_security', subject: 'Security & compliance documentation enclosed' },\n    { day: 6, id: 'enterprise_roi', subject: 'ROI calculator: See your projected savings' },\n    { day: 9, id: 'enterprise_demo', subject: 'Book a solution architect session' },\n    { day: 12, id: 'enterprise_close', subject: 'Enterprise agreement options for your team' }\n  ]},\n  agency_adam: { label: 'Agency Adam', sequences: [\n    { day: 0, id: 'agency_welcome', subject: 'Welcome! Built for agencies like yours' },\n    { day: 2, id: 'agency_multitenancy', subject: 'Manage 10+ clients from one dashboard' },\n    { day: 5, id: 'agency_whitelabel', subject: 'White-label options & client reporting' },\n    { day: 8, id: 'agency_partner', subject: 'Agency partner program: Earn while you grow' },\n    { day: 12, id: 'agency_close', subject: 'Agency pricing tiers - find your fit' }\n  ]},\n  freelancer_fran: { label: 'Freelancer Fran', sequences: [\n    { day: 0, id: 'freelancer_welcome', subject: 'Welcome! Your one-person powerhouse toolkit' },\n    { day: 2, id: 'freelancer_quickwins', subject: '5 automations that save freelancers 5hrs/week' },\n    { day: 5, id: 'freelancer_growth', subject: 'How freelancers use this to land bigger clients' },\n    { day: 8, id: 'freelancer_templates', subject: 'Templates made for solo professionals' },\n    { day: 12, id: 'freelancer_close', subject: 'Freelancer-friendly pricing - keep your momentum' }\n  ]}\n};\n\nconst APPROVAL_BASE = 'https://savvyanalytics.app.n8n.cloud/webhook/trial-approval';\nconst results = [];\n\nfor (const item of items) {\n  const records = item.json.data || [item.json];\n  for (const record of records) {\n    const values = record.values || {};\n    const emailArr = values.email_addresses || [];\n    const email = emailArr[0]?.email_address || emailArr[0]?.value || '';\n    if (!email) continue;\n    const nameArr = values.name || [];\n    const firstName = nameArr[0]?.first_name || '';\n    const lastName = nameArr[0]?.last_name || '';\n    const recordId = record.id?.record_id || '';\n    const getVal = (attr, fb) => { const a = values[attr] || []; return a.length ? (a[0]?.value ?? a[0] ?? fb) : fb; };\n\n    const trialStartDate = getVal('trial_start_date', '');\n    if (!trialStartDate) continue;\n    const trialDay = Math.floor(now.diff(DateTime.fromISO(trialStartDate), 'days').days);\n    if (trialDay > 14) continue;\n\n    const lastEmailSent = getVal('last_email_sent', '');\n    if (lastEmailSent && DateTime.fromISO(lastEmailSent).hasSame(now, 'day')) continue;\n\n    const sequenceStep = Number(getVal('sequence_step', 0));\n    let persona = getVal('persona_segment', '');\n    const leadScore = Number(getVal('lead_score', 0));\n    const featureUsage = Number(getVal('feature_usage', 0));\n    const formSubs = Number(getVal('form_submissions', 0));\n\n    // Auto-detect persona\n    if (!persona) {\n      if (formSubs >= 3 && featureUsage >= 10) persona = 'enterprise_eva';\n      else if (featureUsage >= 5) persona = 'agency_adam';\n      else if (leadScore >= 50) persona = 'startup_steve';\n      else persona = 'freelancer_fran';\n    }\n\n    const p = PERSONAS[persona] || PERSONAS.freelancer_fran;\n    let seqEmail = null, stepIdx = -1;\n    for (let i = p.sequences.length - 1; i >= 0; i--) {\n      if (trialDay >= p.sequences[i].day && i >= sequenceStep) {\n        seqEmail = p.sequences[i]; stepIdx = i; break;\n      }\n    }\n    if (!seqEmail || stepIdx < sequenceStep) continue;\n\n    // Merge template from Sheets (or use default)\n    const tplKey = `${persona}_${stepIdx}`;\n    const tpl = templates[tplKey] || {};\n    const subject = (tpl.subject || seqEmail.subject).replace('{{name}}', firstName).replace('{{company}}', 'your team');\n    const htmlBody = tpl.htmlBody || `<div style=\"font-family:Arial,sans-serif;max-width:600px;margin:0 auto;\"><p>Hi ${firstName},</p><p>Day ${trialDay} of your trial.</p><p><strong>Template:</strong> ${seqEmail.id}</p><p><strong>Persona:</strong> ${p.label}</p><br><p>— The Team</p></div>`;\n\n    // Build approval URLs\n    const params = `email=${encodeURIComponent(email)}&name=${encodeURIComponent(firstName + ' ' + lastName)}&persona=${persona}&step=${stepIdx}`;\n    const approveUrl = `${APPROVAL_BASE}?action=approve&${params}`;\n    const skipUrl = `${APPROVAL_BASE}?action=skip&${params}`;\n\n    results.push({ json: {\n      email, firstName, lastName, fullName: `${firstName} ${lastName}`.trim(),\n      recordId, personaSegment: persona, personaLabel: p.label,\n      trialDay, sequenceStep: stepIdx, nextStep: stepIdx + 1,\n      emailSubject: subject, emailHtml: htmlBody, emailTemplate: seqEmail.id,\n      leadScore, approveUrl, skipUrl, processedAt: now.toISO()\n    }});\n  }\n}\nreturn results.length > 0 ? results : [{ json: { skip: true, reason: 'No trial contacts require email today' } }];"
+      },
+      "id": "persona-engine",
+      "name": "Persona & Template Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        944,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "not-skipped",
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "notTrue"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-should-send",
+      "name": "Has Emails to Send?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1184,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "draft",
+        "subject": "={{ $json.emailSubject }}",
+        "emailType": "html",
+        "message": "={{ $json.emailHtml }}",
+        "options": {
+          "sendTo": "={{ $json.email }}"
+        }
+      },
+      "id": "gmail-draft",
+      "name": "Gmail: Create Draft",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1424,
+        304
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "webhookId": "72cb7927-e5fd-4b52-96f7-c8da1779f4b4",
+      "credentials": {},
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "https://api.attio.com/v2/objects/people/records",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "matching_attribute",
+              "value": "email_addresses"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ \"data\": { \"values\": { \"email_addresses\": [$json.email], \"approval_status\": \"pending\", \"persona_segment\": $json.personaSegment } } }) }}",
+        "options": {}
+      },
+      "id": "attio-pending",
+      "name": "Update Attio: Pending Approval",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1664,
+        304
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "revops-alerts",
+          "mode": "name"
+        },
+        "text": "={{ '📧 *DRAFT READY FOR REVIEW*\\n\\n' + '*Contact:* ' + $json.fullName + ' (' + $json.email + ')\\n' + '*Persona:* ' + $json.personaLabel + '\\n' + '*Trial Day:* ' + $json.trialDay + ' | *Step:* ' + $json.sequenceStep + '\\n' + '*Subject:* ' + $json.emailSubject + '\\n' + '*Template:* ' + $json.emailTemplate + '\\n\\n' + '✅ <' + $json.approveUrl + '|Approve & Continue>\\n' + '⏭️ <' + $json.skipUrl + '|Skip This Email>' }}",
+        "otherOptions": {}
+      },
+      "id": "slack-approval",
+      "name": "Slack: Review & Approve",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        1904,
+        304
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "webhookId": "607b6262-2217-4d53-8e6f-2e08cb0938c5",
+      "credentials": {},
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {},
+      "id": "no-emails",
+      "name": "No Emails Today",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1424,
+        528
+      ]
+    }
+  ],
+  "connections": {
+    "Daily 9am CST": {
+      "main": [
+        [
+          {
+            "node": "Fetch Email Templates (Sheets)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Email Templates (Sheets)": {
+      "main": [
+        [
+          {
+            "node": "Fetch Trial Contacts (Attio)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Trial Contacts (Attio)": {
+      "main": [
+        [
+          {
+            "node": "Persona & Template Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persona & Template Engine": {
+      "main": [
+        [
+          {
+            "node": "Has Emails to Send?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Emails to Send?": {
+      "main": [
+        [
+          {
+            "node": "Gmail: Create Draft",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Emails Today",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail: Create Draft": {
+      "main": [
+        [
+          {
+            "node": "Update Attio: Pending Approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Attio: Pending Approval": {
+      "main": [
+        [
+          {
+            "node": "Slack: Review & Approve",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "3e4912fef641284d170751e8ec0cc4d283c69016a6a3ffb98d665ad5582803e9"
+  }
+}
